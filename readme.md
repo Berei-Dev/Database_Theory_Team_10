@@ -27,7 +27,7 @@ docker build -f ~/docker -t team10-postgres:custom .
 Create a new container on every boot that uses the same background information:
 
 ```sh
-docker run --rm --name team-10-postgres --network team10-net -e POSTGRES_PASSWORD=<choose a password> -p 5432:5432 -v postgres_data:/var/lib/postgresql -d team10-postgres:custom
+docker run --rm --name team-10-postgres --network team10-net --shm-size=512m -e POSTGRES_PASSWORD=de42573a -p 5432:5432 -v postgres_data:/var/lib/postgresql -d team10-postgres:custom
 ```
 
 ## Create the live pgAdmin container

@@ -169,6 +169,7 @@
 #include "executor/nodeHash.h"
 #include "executor/nodeHashjoin.h"
 #include "miscadmin.h"
+#include "optimizer/optimizer.h"
 #include "utils/lsyscache.h"
 #include "utils/sharedtuplestore.h"
 #include "utils/wait_event.h"
@@ -177,12 +178,28 @@
 /*
  * States of the ExecHashJoin state machine
  */
+/* Comment out to disable the Lookup/Expand push-down at compile time */
+#define HJ_LOOKUP_PUSHDOWN
+
 #define HJ_BUILD_HASHTABLE		1
 #define HJ_NEED_NEW_OUTER		2
 #define HJ_SCAN_BUCKET			3
 #define HJ_FILL_OUTER_TUPLE		4
 #define HJ_FILL_INNER_TUPLES	5
 #define HJ_NEED_NEW_BATCH		6
+#define HJ_EXPAND_LEFT			7	/* Lookup/Expand: expand pushed-down child */
+
+/*
+ * Lookup/Expand push-down ("Robust Join Processing with Diamond Hardened
+ * Joins", Birler/Kemper/Neumann).  True while this join is consuming tuples
+ * straight from a child HashJoin that runs in lookup-only mode, i.e. the
+ * child hands us its first match and leaves its hash-bucket iterator
+ * suspended.  Only batch 0 reads from the child; later batches replay
+ * tuples that were already fully expanded and spilled to a batch file.
+ */
+#define HJ_PUSHED(hjstate, hashtable, parallel) \
+	(!(parallel) && (hjstate)->hj_LookupChild != NULL && \
+	 (hashtable)->curbatch == 0)
 
 /* Returns true if doing null-fill on outer relation */
 #define HJ_FILL_OUTER(hjstate)	((hjstate)->hj_NullInnerTupleSlot != NULL)
@@ -202,6 +219,8 @@ static TupleTableSlot *ExecHashJoinGetSavedTuple(HashJoinState *hjstate,
 static bool ExecHashJoinNewBatch(HashJoinState *hjstate);
 static bool ExecParallelHashJoinNewBatch(HashJoinState *hjstate);
 static void ExecParallelHashJoinPartitionOuter(HashJoinState *hjstate);
+static bool ExecHashJoinExpand(HashJoinState *node);
+static bool ExecHashJoinCanPushLookup(HashJoinState *upper, HashJoin *uplan);
 
 
 /* ----------------------------------------------------------------
@@ -498,8 +517,42 @@ ExecHashJoinImpl(PlanState *pstate, bool parallel)
 					if (shouldFree)
 						heap_free_minimal_tuple(mintuple);
 
+					/*
+					 * Lookup/Expand push-down: the child only gave us the
+					 * first of its matches for this outer tuple.  They all
+					 * share this hash value (checked in
+					 * ExecHashJoinCanPushLookup), so expand the rest now and
+					 * postpone each one to the same later batch.
+					 */
+					while (HJ_PUSHED(node, hashtable, parallel) &&
+						   ExecHashJoinExpand(node->hj_LookupChild))
+					{
+						mintuple = ExecFetchSlotMinimalTuple(outerTupleSlot,
+															 &shouldFree);
+						ExecHashJoinSaveTuple(mintuple, hashvalue,
+											  &hashtable->outerBatchFile[batchno],
+											  hashtable);
+						if (shouldFree)
+							heap_free_minimal_tuple(mintuple);
+					}
+
 					/* Loop around, staying in HJ_NEED_NEW_OUTER state */
 					continue;
+				}
+
+				/*
+				 * Lookup/Expand push-down, LOOKUP step: probe our hash table
+				 * for the first key match without expanding either side.  If
+				 * there is none, the child's remaining matches for this tuple
+				 * are never produced.  The child already parked itself in
+				 * HJ_NEED_NEW_OUTER, so just move on.
+				 */
+				if (HJ_PUSHED(node, hashtable, parallel))
+				{
+					node->hj_CurTuple = NULL;
+					if (!ExecScanHashBucket(node, econtext))
+						continue;	/* stay in HJ_NEED_NEW_OUTER */
+					node->hj_CurTuple = NULL;	/* rewind for the expand */
 				}
 
 				/* OK, let's scan the bucket for matches */
@@ -526,7 +579,8 @@ ExecHashJoinImpl(PlanState *pstate, bool parallel)
 					if (!ExecScanHashBucket(node, econtext))
 					{
 						/* out of matches; check for possible outer-join fill */
-						node->hj_JoinState = HJ_FILL_OUTER_TUPLE;
+						node->hj_JoinState = HJ_PUSHED(node, hashtable, parallel) ?
+							HJ_EXPAND_LEFT : HJ_FILL_OUTER_TUPLE;
 						continue;
 					}
 				}
@@ -576,7 +630,8 @@ ExecHashJoinImpl(PlanState *pstate, bool parallel)
 					 * processed this one.
 					 */
 					if (node->js.single_match)
-						node->hj_JoinState = HJ_NEED_NEW_OUTER;
+						node->hj_JoinState = HJ_PUSHED(node, hashtable, parallel) ?
+							HJ_EXPAND_LEFT : HJ_NEED_NEW_OUTER;
 
 					/*
 					 * In a right-antijoin, we never return a matched tuple.
@@ -588,7 +643,17 @@ ExecHashJoinImpl(PlanState *pstate, bool parallel)
 						continue;
 
 					if (otherqual == NULL || ExecQual(otherqual, econtext))
+					{
+						/*
+						 * Lookup-only mode: hand the first qualifying match to
+						 * the parent and suspend.  hj_CurTuple/bucket/hashvalue
+						 * are left untouched; they are the iterator the parent
+						 * resumes via ExecHashJoinExpand().
+						 */
+						if (node->hj_LookupOnly)
+							node->hj_JoinState = HJ_NEED_NEW_OUTER;
 						return ExecProject(node->js.ps.ps_ProjInfo);
+					}
 					else
 						InstrCountFiltered2(node, 1);
 				}
@@ -648,6 +713,29 @@ ExecHashJoinImpl(PlanState *pstate, bool parallel)
 				else
 					InstrCountFiltered2(node, 1);
 				break;
+
+			case HJ_EXPAND_LEFT:
+
+				/*
+				 * Lookup/Expand push-down, EXPAND step for the child: advance
+				 * the child's suspended iterator to its next match for the
+				 * current outer tuple.  The child re-projects into its own
+				 * result slot, which is our outer tuple, so the new combination
+				 * is visible in place.  Then replay our own bucket from the start
+				 * (our hash value/bucket are unchanged: the key only depends on
+				 * columns that do not vary between the child's matches).
+				 */
+				if (!ExecHashJoinExpand(node->hj_LookupChild))
+				{
+					node->hj_JoinState = HJ_NEED_NEW_OUTER;
+					continue;
+				}
+				econtext->ecxt_outertuple =
+					node->hj_LookupChild->js.ps.ps_ResultTupleSlot;
+				node->hj_CurTuple = NULL;
+				node->hj_MatchedOuter = false;
+				node->hj_JoinState = HJ_SCAN_BUCKET;
+				continue;
 
 			case HJ_NEED_NEW_BATCH:
 
@@ -935,7 +1023,132 @@ ExecInitHashJoin(HashJoin *node, EState *estate, int eflags)
 	hjstate->hj_MatchedOuter = false;
 	hjstate->hj_OuterNotEmpty = false;
 
+	hjstate->hj_LookupOnly = false;
+	hjstate->hj_LookupChild = NULL;
+
+#ifdef HJ_LOOKUP_PUSHDOWN
+	/*
+	 * Decide whether to run our child join in lookup-only mode.  The child was
+	 * initialized above, so its own decision (as a parent) is already made.
+	 */
+	if (ExecHashJoinCanPushLookup(hjstate, node))
+	{
+		HashJoinState *child = (HashJoinState *) outerPlanState(hjstate);
+
+		child->hj_LookupOnly = true;
+		hjstate->hj_LookupChild = child;
+	}
+#endif
+
 	return hjstate;
+}
+
+/* ----------------------------------------------------------------
+ *		ExecHashJoinCanPushLookup
+ *
+ *		Can "upper" consume its outer child (another HashJoin) in
+ *		lookup-only mode?  Conservative on purpose: plain inner joins only,
+ *		serial only, one level of push-down, and the upper join's hash keys
+ *		must be computed solely from columns that originate on the child's
+ *		own outer side, so that every match of the child yields the same key.
+ * ----------------------------------------------------------------
+ */
+static bool
+ExecHashJoinCanPushLookup(HashJoinState *upper, HashJoin *uplan)
+{
+	PlanState  *child = outerPlanState(upper);
+	HashJoinState *lower;
+	HashJoin   *lplan;
+	ListCell   *lc;
+
+	if (!IsA(child, HashJoinState))
+		return false;
+
+	lower = (HashJoinState *) child;
+	lplan = (HashJoin *) lower->js.ps.plan;
+
+	if (uplan->join.jointype != JOIN_INNER ||
+		lplan->join.jointype != JOIN_INNER)
+		return false;
+
+	/* parallel-aware nodes swap in ExecParallelHashJoin; not supported */
+	if (uplan->join.plan.parallel_aware || lplan->join.plan.parallel_aware)
+		return false;
+
+	/* only one level: the child must not itself be a pushed-down parent */
+	if (lower->hj_LookupChild != NULL || lower->hj_LookupOnly)
+		return false;
+
+	foreach(lc, uplan->hashkeys)
+	{
+		List	   *vars = pull_var_clause((Node *) lfirst(lc), 0);
+		ListCell   *lc2;
+
+		foreach(lc2, vars)
+		{
+			Var		   *var = (Var *) lfirst(lc2);
+			TargetEntry *tle;
+
+			if (!IsA(var, Var) || var->varno != OUTER_VAR ||
+				var->varattno <= 0 ||
+				var->varattno > list_length(lplan->join.plan.targetlist))
+				return false;
+
+			/* column must be a plain pass-through of the child's outer side */
+			tle = list_nth_node(TargetEntry, lplan->join.plan.targetlist,
+								var->varattno - 1);
+			if (!IsA(tle->expr, Var) ||
+				((Var *) tle->expr)->varno != OUTER_VAR)
+				return false;
+		}
+	}
+
+	return true;
+}
+
+/* ----------------------------------------------------------------
+ *		ExecHashJoinExpand
+ *
+ *		EXPAND step of Lookup/Expand for a join running in lookup-only mode.
+ *		Resumes the suspended bucket iterator (hj_CurTuple et al.) of the
+ *		current outer tuple, applies the join quals exactly like
+ *		HJ_SCAN_BUCKET, and projects the next match into the node's result
+ *		slot.  Returns false when the iterator is exhausted.
+ * ----------------------------------------------------------------
+ */
+static bool
+ExecHashJoinExpand(HashJoinState *node)
+{
+	ExprContext *econtext = node->js.ps.ps_ExprContext;
+	ExprState  *joinqual = node->js.joinqual;
+	ExprState  *otherqual = node->js.ps.qual;
+
+	Assert(node->hj_LookupOnly);
+
+	/* inner-unique: the lookup already produced the only possible match */
+	if (node->js.single_match)
+		return false;
+
+	/* previous projection is dead now; free its per-tuple memory */
+	ResetExprContext(econtext);
+
+	while (ExecScanHashBucket(node, econtext))
+	{
+		if (joinqual != NULL && !ExecQual(joinqual, econtext))
+		{
+			InstrCountFiltered1(node, 1);
+			continue;
+		}
+		if (otherqual != NULL && !ExecQual(otherqual, econtext))
+		{
+			InstrCountFiltered2(node, 1);
+			continue;
+		}
+		ExecProject(node->js.ps.ps_ProjInfo);
+		return true;
+	}
+
+	return false;
 }
 
 /* ----------------------------------------------------------------
