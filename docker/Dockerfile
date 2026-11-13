@@ -14,12 +14,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /src
 
-# Download the same version as the base image (keeps the data directory compatible)
+# Download the same version as the base image
 RUN PGVER=$(postgres --version | awk '{print $3}') \
  && curl -fsSL https://ftp.postgresql.org/pub/source/v${PGVER}/postgresql-${PGVER}.tar.bz2 \
     | tar xj --strip-components=1
 
-# Compile the stock source once (this layer is cached)
+# Compile the stock source once
 RUN ./configure \
       --prefix=/usr/lib/postgresql/18 \
       --enable-depend --enable-debug ${CASSERT} \
@@ -28,13 +28,22 @@ RUN ./configure \
       CFLAGS="${CFLAGS_OPT} -g" \
  && make -j"$(nproc)"
 
-# Overlay your modified files (e.g. nodeHashjoin.c, nodeHash.c), rebuild only what changed
+# Overlay modified PostgreSQL source files
+# Includes:
+#   src/backend/executor/nodeHashjoin.c
+#   src/backend/executor/nodeHash.c
+#   src/include/nodes/execnodes.c
 COPY src/ /overlay/
+
 RUN cp -r /overlay/. /src/src/ \
- && (cd /overlay && find . -type f | xargs -I{} touch /src/src/{}) \
- && make -j"$(nproc)" && make install \
+ && find /overlay -type f | while read -r file; do \
+      touch "/src/src/${file#/overlay/}"; \
+    done \
+ && make -j"$(nproc)" \
+ && make install \
  && make -C contrib -j"$(nproc)" install
 
 # ---------- runtime stage ----------
 FROM postgres:18
+
 COPY --from=build /usr/lib/postgresql/18 /usr/lib/postgresql/18
